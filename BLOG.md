@@ -192,3 +192,59 @@ inline cl_kernel BSContext::kernel() {
     return m_ker;
 }
 ```
+
+## Running the kernel
+Now that we have build the kernel, we can send it to a command queue for execution. Let's create a separate function for that:
+```C++
+template<typename T>
+void BS(BSContext& ctx, std::span<T> data) {
+    auto buf = clCreateBuffer(ctx.context(), CL_MEM_COPY_HOST_PTR, data.size_bytes(), data.data(), nullptr);
+    BSRunKernel<T>(ctx, buf, data.size());
+}
+```
+
+```C++
+template<typename T>
+inline void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
+    ...
+}
+```
+
+First, we need to determine how many threads we need to launch. Since each thread operates on 2 elements, we should launch half as many threads as there are elements:
+```C++
+    size_t global_sz = cnt / 2;
+    assert((cnt & (cnt - 1)) == 0);
+```
+We also check that we are working on a buffer whose length is a power of 2.
+
+Then we set the kernels arguments using clSetKernelArg and launch the kernel with clEnqueueNDRangeKernel:
+```
+    clSetKernelArg(ker, 0, sizeof(buf), &buf);
+    for (cl_uint seq_cnt = 1; seq_cnt <= cnt / 2; seq_cnt *= 2) {
+        for (cl_uint subseq_cnt = seq_cnt; subseq_cnt >= 1; subseq_cnt /= 2) {
+            clSetKernelArg(ker, 1, sizeof(seq_cnt), &seq_cnt);
+            clSetKernelArg(ker, 2, sizeof(subseq_cnt), &subseq_cnt);
+            clEnqueueNDRangeKernel(ctx.queue(), ctx.kernel<T>(), 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
+        }
+    }
+```
+
+## Reading the results back
+After the kernel has finished executing, we need some way to copy results from the buffer that we created back into CPU memory. We use clEnqueueReadBuffer for that:
+```C++
+template<typename T>
+void BS(BSContext& ctx, std::span<T> data) {
+    auto buf = clCreateBuffer(ctx.context(), CL_MEM_COPY_HOST_PTR, data.size_bytes(), data.data(), nullptr);
+    BSRunKernel<T>(ctx, buf, data.size());
+    clEnqueueReadBuffer(ctx.queue(), buf, true, 0, data.size_bytes(), data.data(), 0, nullptr, nullptr);
+}
+```
+
+## Conclusion
+We now have a parallel sorting algorithm that runs on an OpenCL device. In the next part we will look at how make it usable with types other than `int`.
+
+# Part 2 -- type generic bitonic sort
+
+# Part 3 -- local memory
+
+# Part 4 -- asynchronous queues
