@@ -82,8 +82,8 @@ template<typename T>
 inline void BSContext::buildKernel() {
     const char* src =
     "#define KERNEL_TYPE int\n" 
-    "__attribute__((reqd_work_group_size(256, 1, 1)))\n"
-    "__kernel void bitonicSort(__global KERNEL_TYPE* data, uint cnt, uint seq_cnt, uint subseq_cnt) {\n"
+    "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
+    "__kernel void bitonicSort(__global KERNEL_TYPE* data, uint seq_cnt, uint subseq_cnt) {\n"
     "   size_t i = get_global_id(0);\n"
     "   size_t sml_idx = (i & (subseq_cnt - 1)) | ((i & ~(subseq_cnt - 1)) << 1);\n"
     "   size_t big_idx = sml_idx + subseq_cnt;\n"
@@ -109,52 +109,42 @@ inline void BSContext::buildKernel() {
 }
 
 template<typename T>
-inline cl_event BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
-    auto dev = ctx.device();
+inline void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     auto q = ctx.queue();
     auto ker = ctx.kernel<T>();
-
-    cl_event prev_e = nullptr;
-    cl_event cur_e = prev_e;
     size_t global_sz = cnt / 2;
-    {
-        size_t local_sz[3];
-        clGetKernelWorkGroupInfo(ker, dev, CL_KERNEL_COMPILE_WORK_GROUP_SIZE, sizeof(local_sz), local_sz, nullptr);
-        global_sz = (global_sz / local_sz[0] + (global_sz % local_sz[0] != 0)) * local_sz[0];
-    }
-    cl_uint clcnt = cnt;
-    assert(clcnt == cnt);
     clSetKernelArg(ker, 0, sizeof(buf), &buf);
-    clSetKernelArg(ker, 1, sizeof(clcnt), &clcnt);
     for (cl_uint seq_cnt = 1; seq_cnt <= cnt / 2; seq_cnt *= 2) {
         for (cl_uint subseq_cnt = seq_cnt; subseq_cnt >= 1; subseq_cnt /= 2) {
-            clSetKernelArg(ker, 2, sizeof(seq_cnt), &seq_cnt);
-            clSetKernelArg(ker, 3, sizeof(subseq_cnt), &subseq_cnt);
-            clEnqueueNDRangeKernel(q, ker, 1, nullptr, &global_sz, nullptr, prev_e ? 1: 0, prev_e ? &prev_e: nullptr, &cur_e);
-            prev_e = cur_e;
+            clSetKernelArg(ker, 1, sizeof(seq_cnt), &seq_cnt);
+            clSetKernelArg(ker, 2, sizeof(subseq_cnt), &subseq_cnt);
+            clEnqueueNDRangeKernel(q, ker, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
         }
     }
-
-    return cur_e;
 }
 
 template<typename T>
 void BS(BSContext& ctx, std::span<T> data) {
     auto buf = clCreateBuffer(ctx.context(), CL_MEM_COPY_HOST_PTR, data.size_bytes(), data.data(), nullptr);
-    auto kernel_e = BSRunKernel<T>(ctx, buf, data.size());
-    clEnqueueReadBuffer(ctx.queue(), buf, true, 0, data.size_bytes(), data.data(), 1, &kernel_e, nullptr);
+    BSRunKernel<T>(ctx, buf, data.size());
+    clEnqueueReadBuffer(ctx.queue(), buf, true, 0, data.size_bytes(), data.data(), 0, nullptr, nullptr);
 }
+}
+
+template<typename T>
+void bitonicSort(std::span<T> data) {
+    static Detail::BSContext ctx;
+    Detail::BS(ctx, data);
 }
 
 template<std::contiguous_iterator I>
 void bitonicSort(I first, I last) {
-    static Detail::BSContext ctx;
-    Detail::BS(ctx, std::span(first, last));
+    bitonicSort(std::span(first, last));
 }
 
 template<std::input_iterator I>
 void bitonicSort(I first, I last) {
     std::vector data(first, last);
-    bitonicSort(data.begin(), data.end());
+    bitonicSort(data);
     std::copy(first, data.begin(), data.end());
 }
