@@ -1,13 +1,10 @@
 # Part 1 -- Basic implementation of bitonic sort
 
-Bitonic is a parallel sorting algorithm that is relatively easy to implement on the GPU.
-For a more detail explanation, see [Wikipedia](https://en.wikipedia.org/wiki/Bitonic_sorter).
-
-In this first part, I am going to talk how I implemented an unoptimized version of bitonic sort for integers.
+Bitonic is a parallel sorting algorithm that is relatively easy to implement on the GPU. In this first part, I am going to talk about how I implemented an unoptimized version of bitonic sort for integers using OpenCL.
 
 ## OpenCL
 OpenCL is a general purpose computing API designed by the Khronos Group.
-To start using OpenCL, we must create a context, and for that we have to select a platform and a device.
+To start using OpenCL, we have to create a context, and for that we have to select a platform and a device.
 Platforms roughly correspond to the various OpenCL devices drivers that you have installed on your system, while devices are the physical devices that these drivers can talk to. For most people, this will be either a CPU or a GPU. In my implementation of bitonic sort I search only for GPUs for simplicity.
 Once we have a selected a platform and a device, we can create a context. Contexts roughly correspond to a connection to a device through a driver. Multiple contexts can be created, so one can run multiple programs that uses OpenCL at the same time.
 
@@ -103,6 +100,7 @@ void bitonicSort(I first, I last) {
 }
 ```
 
+## Buffers
 Memory that OpenCL devices access while performing various operations is stored in OpenCL buffers. Let's create a buffer:
 ```C++
 template<typename T>
@@ -112,14 +110,15 @@ void BS(BSContext& ctx, std::span<T> data) {
 ```
 As you can see, buffers are created within a context. CL_MEM_COPY_HOST_PTR means that we are going to provide an array with data for the buffer's initial contents.
 
-Now that we have our data in device-accessible memory, let's write a program that will do something with it.
-OpenCL programs are written in OpenCL C and follow the SIMT execution model. SIMT means that while we have multiple threads, they are all executing the same instruction on different data.
+## Kernels
+Now that we have our data in device-accessible memory, let's write a program that will do something with it. In OpenCL terminology programs written for devices are called kernels. OpenCL kernels are written in OpenCL C and follow the SIMT execution model. SIMT means that while we have multiple threads, they are all executing the same instruction on different data. So OpenCL C is basicly C with functionality added for SIMT programming.
 
+Let's take a look a kernel implementing bitonic sort:
 ```C
  #define KERNEL_TYPE int
  
- __attribute__((reqd_work_group_size(256, 1, 1)))
- __kernel void bitonicSort(__global KERNEL_TYPE* data, uint cnt, uint seq_cnt, uint subseq_cnt) {
+ __attribute__((reqd_work_group_size(1, 1, 1)))
+ __kernel void bitonicSort(__global KERNEL_TYPE* data, uint seq_cnt, uint subseq_cnt) {
     size_t i = get_global_id(0);
     size_t sml_idx = (i & (subseq_cnt - 1)) | ((i & ~(subseq_cnt - 1)) << 1);
     size_t big_idx = sml_idx + subseq_cnt;
@@ -131,3 +130,18 @@ OpenCL programs are written in OpenCL C and follow the SIMT execution model. SIM
     }
  };
 ```
+I'm going to skip over reqd_work_group_size for now. Other than that, the only OpenCL C features that are used in this kernel are the `__kernel` and `__global` specifiers, as well as the `get_global_id(0)` function call. Let's go over them.
+
+`__kernel` specifies that this function can be used as an entry point, as we will see a bit later.
+
+`__global` is used to specify that a pointer points to RAM and not some other memory type. Unlike normal C programs, in OpenCL C you can directly cpecify whether data is stored in RAM or cache, so specifiers like `__global` have to be used.
+
+`get_global_id(0)` is where things get interesting. Kernels are launched to perform work in N dimensions, and each dimension has an integral size. This is called an NDRange. Each thread is assigned a unique coordinate vector within this NDRange, which can be used however you like. In the case of bitonic sort, N is 1, so our coordinate is a simple 1D index which we can use to deside what elements in the buffer we are going to access. We retrive it by calling `get_global_id(0)` to get a thread's coordinate in dimension 0. You might have also notices that the buffer's size is not explicitly specified. This is fine, since we can simply launch n threads, where n is the buffer size, and we will not have any out of bounds accesses.
+
+## Bitonic sort
+[Wikipedia](https://en.wikipedia.org/wiki/Bitonic_sorter) has an article that explains how bitonic sort works in detail. I'm going to quickly go over it.
+A sequence of length n is bitonic if it does not decrease from 0 to k, and does not increase from k to n. So the smallest bitonic sequence is simply a pair to 2 numbers.
+Now let's sort a bitonic sequence of length 2n in ascending order. For each element k from 0 to n, we will compare it with element k+n and swap them if element k is greater. The elements from 0 to n now form a bitonic sequence, and so do the elements from n to 2n. At the same time, any element from 0 to n is smaller than any element from n to 2n. I will leave these two points without proof. After we sort the two new bitonic sequences in ascending order, we will have a single sequence in sorted order.
+We can obtain a bitonic sequence of length 2n by combining a sequence of length n sorted in ascending order and a sequence of length n sorted in descending order.
+By combining these two procedures we can build a sorting algorithm. Start by creating sorted sequences of length 2 -- this only requires swapping 2 elements if they are not already in sorted order. These sequences can now be used to created bitonic sequences of length 4, which can then bo sorted. Continue doing this until get a sorted sequence of length l.
+Note that currently we are only capable of sorting sequences where l is a power of 2.
