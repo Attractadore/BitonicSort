@@ -140,8 +140,55 @@ I'm going to skip over reqd_work_group_size for now. Other than that, the only O
 
 ## Bitonic sort
 [Wikipedia](https://en.wikipedia.org/wiki/Bitonic_sorter) has an article that explains how bitonic sort works in detail. I'm going to quickly go over it.
+
 A sequence of length n is bitonic if it does not decrease from 0 to k, and does not increase from k to n. So the smallest bitonic sequence is simply a pair to 2 numbers.
+
 Now let's sort a bitonic sequence of length 2n in ascending order. For each element k from 0 to n, we will compare it with element k+n and swap them if element k is greater. The elements from 0 to n now form a bitonic sequence, and so do the elements from n to 2n. At the same time, any element from 0 to n is smaller than any element from n to 2n. I will leave these two points without proof. After we sort the two new bitonic sequences in ascending order, we will have a single sequence in sorted order.
+
 We can obtain a bitonic sequence of length 2n by combining a sequence of length n sorted in ascending order and a sequence of length n sorted in descending order.
+
 By combining these two procedures we can build a sorting algorithm. Start by creating sorted sequences of length 2 -- this only requires swapping 2 elements if they are not already in sorted order. These sequences can now be used to created bitonic sequences of length 4, which can then bo sorted. Continue doing this until get a sorted sequence of length l.
+
 Note that currently we are only capable of sorting sequences where l is a power of 2.
+
+## Bitonic sort kernel
+In the kernel that I wrote, each thread is respocible for comparing 2 elements and swapping them if necessary. `seq_cnt` is half the length of the top level sequence that we are currently sorting and is used to determine the swap condition `swap_cond` (the sort order). `subseq_cnt` is half the length of the subsequence of the top level sequence that we are currently sorting and is used to determine which items we are actually supposed to compare and swap.  
+
+Currently, the only data type that is supported is int, and we will add more types later.
+
+## Building the kernel
+Before we can run out kernel, we first have to build it:
+```C++
+template<typename T>
+inline void BSContext::buildKernel() {
+    const char* src = ...;
+    auto prog = clCreateProgramWithSource(m_ctx, 1, &src, nullptr, nullptr);
+    auto prog_err = clBuildProgram(prog, 1, &m_dev, "", nullptr, nullptr);
+    if (prog_err == CL_BUILD_PROGRAM_FAILURE) {
+        size_t log_sz;
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_sz);
+        std::vector<char> log(log_sz);
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
+        throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
+    }
+    m_ker = clCreateKernel(prog, "bitonicSort", nullptr);
+    clReleaseProgram(prog);
+}
+```
+In OpenCL, kernel compilation happens through program objects. After creating a program object and specifying it's source code by using clCreateProgramWithSource, we compile it by calling clBuildProgram. If compilation fails (must often this happens if you made an error in your kernel source), we can extract a programs build log by using clGetProgramBuildInfo.
+Once the program has been built, we can use it to create a kernel object by using clCreateKernel. The second parameter specifies an entrypoint -- you can have multiple kernels is a single source file, so there hase to be a way to specify which kernel you want to launch. Here I use "bitonicSort" as my entryoint.
+After we have created all the kernels that we need from a program object, we can free it by calling clReleaseProgram.
+
+Since rebuilding the kernel all the time can be expensive, I cache it in `BSContext`. If it has not already been built, we first build it before giving it to the user: 
+```C++
+template<typename T>
+inline cl_kernel BSContext::kernel() {
+    static_assert(std::same_as<T, int>);
+
+    if (!m_ker) {
+        buildKernel<T>();
+    }
+
+    return m_ker;
+}
+```
