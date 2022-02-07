@@ -12,10 +12,10 @@
 namespace Detail {
 class BSContext {
 private:
-    cl_context m_ctx;
-    cl_device_id m_dev;
-    cl_command_queue m_q;
-    cl_kernel m_ker;
+    cl_context m_ctx = nullptr;
+    cl_device_id m_dev = nullptr;
+    cl_command_queue m_q = nullptr;
+    cl_kernel m_ker = nullptr;
 
 public:
     BSContext();
@@ -38,7 +38,11 @@ public:
     }
 
     template<typename T>
-    cl_kernel kernel() const;
+    cl_kernel kernel();
+
+private:
+    template<typename T>
+    void buildKernel();
 };
 
 inline BSContext::BSContext() {
@@ -54,7 +58,28 @@ inline BSContext::BSContext() {
     clGetContextInfo(m_ctx, CL_CONTEXT_DEVICES, sizeof(cl_device_id), &m_dev, nullptr);
 
     m_q = clCreateCommandQueue(m_ctx, m_dev, 0, nullptr);
+}
 
+inline BSContext::~BSContext() {
+    clFinish(m_q);
+    clReleaseKernel(m_ker);
+    clReleaseCommandQueue(m_q);
+    clReleaseContext(m_ctx);
+}
+
+template<typename T>
+inline cl_kernel BSContext::kernel() {
+    static_assert(std::same_as<T, int>);
+
+    if (!m_ker) {
+        buildKernel<T>();
+    }
+
+    return m_ker;
+}
+
+template<typename T>
+inline void BSContext::buildKernel() {
     const char* src =
     "#define KERNEL_TYPE int\n" 
     "__attribute__((reqd_work_group_size(256, 1, 1)))\n"
@@ -81,19 +106,6 @@ inline BSContext::BSContext() {
     }
     m_ker = clCreateKernel(prog, "bitonicSort", nullptr);
     clReleaseProgram(prog);
-}
-
-inline BSContext::~BSContext() {
-    clFinish(m_q);
-    clReleaseKernel(m_ker);
-    clReleaseCommandQueue(m_q);
-    clReleaseContext(m_ctx);
-}
-
-template<typename T>
-inline cl_kernel BSContext::kernel() const {
-    static_assert(std::same_as<T, int>);
-    return m_ker;
 }
 
 template<typename T>
