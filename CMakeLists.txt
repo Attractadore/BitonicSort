@@ -9,6 +9,9 @@ target_compile_features(BitonicSort INTERFACE cxx_std_20)
 add_executable(sorter sorter.cpp)
 target_link_libraries(sorter BitonicSort)
 
+add_executable(BenchBitonicSort BenchBitonicSort.cpp)
+target_link_libraries(BenchBitonicSort BitonicSort tbb)
+
 find_package(GTest)
 if (TARGET GTest::gtest_main)
     add_executable(TestBitonicSort TestBitonicSort.cpp)
