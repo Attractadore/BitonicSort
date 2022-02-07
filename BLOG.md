@@ -163,7 +163,7 @@ By combining these two procedures we can build a sorting algorithm for an array 
 ## Bitonic sort kernel
 In the kernel that I wrote, each thread is responcible for comparing 2 elements and swapping them if necessary. `seq_cnt` is half the length of the top level sequence that we are currently sorting and is used to determine the swap condition `swap_cond` (the sort order). `subseq_cnt` is half the length of the subsequence of the top level sequence that we are currently sorting and is used to determine which items we are actually supposed to compare and swap.  
 
-Currently, the only data type that is supported is int.
+Currently, the only data type that is supported is `int`.
 
 ## Building the kernel
 Before we can run a kernel, we first have to build it:
