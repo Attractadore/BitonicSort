@@ -1,5 +1,4 @@
 # Part 1 -- Basic implementation of bitonic sort
-
 Bitonic sort is a parallel sorting algorithm that is relatively easy to implement on the GPU. In this first part, I am going to talk about how I implemented an unoptimized version of bitonic sort for integers using OpenCL.
 
 ## OpenCL basics -- Platforms, Devices, Contexts
@@ -261,8 +260,8 @@ In the next part we will look at how make it usable with types other than `int`.
 
 # Part 2 -- Type generic bitonic sort
 
-# Part 3 -- Local memory
+# Part 3 -- Bitonic sort for non power of 2 lengths
 
-# Part 4 -- Asynchronous queues
+# Part 4 -- Local memory
 
-# Part 5 -- Bitonic sort for non power of 2 lengths
+# Part 5 -- Asynchronous queues
