@@ -37,12 +37,10 @@ public:
         return m_q;
     }
 
-    template<typename T>
     cl_kernel kernel();
 
 private:
-    template<typename T>
-    void buildKernel();
+    cl_kernel buildKernel();
 };
 
 inline BSContext::BSContext() {
@@ -67,19 +65,14 @@ inline BSContext::~BSContext() {
     clReleaseContext(m_ctx);
 }
 
-template<typename T>
 inline cl_kernel BSContext::kernel() {
-    static_assert(std::same_as<T, int>);
-
     if (!m_ker) {
-        buildKernel<T>();
+        m_ker = buildKernel();
     }
-
     return m_ker;
 }
 
-template<typename T>
-inline void BSContext::buildKernel() {
+inline cl_kernel BSContext::buildKernel() {
     const char* src =
     "#define KERNEL_TYPE int\n" 
     "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
@@ -104,15 +97,18 @@ inline void BSContext::buildKernel() {
         clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
         throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
     }
-    m_ker = clCreateKernel(prog, "bitonicSort", nullptr);
+    auto ker = clCreateKernel(prog, "bitonicSort", nullptr);
+
     clReleaseProgram(prog);
+
+    return ker;
 }
 
-template<typename T>
 inline void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     auto q = ctx.queue();
-    auto ker = ctx.kernel<T>();
+    auto ker = ctx.kernel();
     size_t global_sz = cnt / 2;
+    assert((cnt & (cnt - 1)) == 0);
     clSetKernelArg(ker, 0, sizeof(buf), &buf);
     for (cl_uint seq_cnt = 1; seq_cnt <= cnt / 2; seq_cnt *= 2) {
         for (cl_uint subseq_cnt = seq_cnt; subseq_cnt >= 1; subseq_cnt /= 2) {
@@ -123,16 +119,15 @@ inline void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     }
 }
 
-template<typename T>
-void BS(BSContext& ctx, std::span<T> data) {
+inline void BS(BSContext& ctx, std::span<int> data) {
     auto buf = clCreateBuffer(ctx.context(), CL_MEM_COPY_HOST_PTR, data.size_bytes(), data.data(), nullptr);
-    BSRunKernel<T>(ctx, buf, data.size());
+    BSRunKernel(ctx, buf, data.size());
     clEnqueueReadBuffer(ctx.queue(), buf, true, 0, data.size_bytes(), data.data(), 0, nullptr, nullptr);
+    clReleaseMemObject(buf);
 }
 }
 
-template<typename T>
-void bitonicSort(std::span<T> data) {
+inline void bitonicSort(std::span<int> data) {
     static Detail::BSContext ctx;
     Detail::BS(ctx, data);
 }
