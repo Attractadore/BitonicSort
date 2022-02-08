@@ -336,38 +336,34 @@ In OpenCL C, integer and float support is mandatory, while half and double suppo
 ```C++
 namespace Detail {
 template<typename T>
-constexpr bool BSTypeSupportedImpl() {
+constexpr bool BSTypeSupportedImpl(BSContext&) {
     return true;
 }
 
 template<>
-inline bool BSTypeSupportedImpl<CLHalf>() {
-    auto& ctx = getBSContext();
+inline bool BSTypeSupportedImpl<CLHalf>(BSContext& ctx) {
     cl_device_fp_config fp_config;
     clGetDeviceInfo(ctx.device(), CL_DEVICE_HALF_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);
     return fp_config;
 }
 
 template<>
-inline bool BSTypeSupportedImpl<CLDouble>() {
-    auto& ctx = getBSContext();
+inline bool BSTypeSupportedImpl<CLDouble>(BSContext& ctx) {
     cl_device_fp_config fp_config;
     clGetDeviceInfo(ctx.device(), CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);
     return fp_config;
 }
 
 template<typename T>
-constexpr bool BSTypeSupported() {
-    if constexpr (not IsCLTypeV<T>) {
-        return false;
-    }
-    return BSTypeSupportedImpl<CLType<T>>();
+bool BSTypeSupported(BSContext& ctx) {
+    return BSTypeSupportedImpl<CLType<T>>(ctx);
 }
 }
 
 template<typename T>
-constexpr bool bitonicSortTypeSupported() {
-    return Detail::BSTypeSupported<T>();
+    requires Detail::IsCLTypeV<T>
+bool bitonicSortTypeSupported() {
+    return Detail::BSTypeSupported<T>(Detail::getBSContext());
 }
 
 template<typename T>
@@ -379,6 +375,129 @@ void bitonicSort(std::span<T> data) {
 ```
 
 We do this by calling `clGetDeviceInfo` to retrieve the corresponding half or double precision capability flags. If the flags are not 0, than half or double operations are supported.
+
+Now let's update our kernel source so it can be used with any valid type:
+```C++
+template<typename T>
+inline void BSContext::buildKernel() {
+    auto src =
+    std::string(getKernelExtensionStr<T>()) +
+    "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
+    "__kernel void bitonicSort(__global KERNEL_TYPE* data, uint seq_cnt, uint subseq_cnt) {\n"
+    "   size_t i = get_global_id(0);\n"
+    "   size_t sml_idx = (i & (subseq_cnt - 1)) | ((i & ~(subseq_cnt - 1)) << 1);\n"
+    "   size_t big_idx = sml_idx + subseq_cnt;\n"
+    "   bool swap_cond = !(i & seq_cnt);\n"
+    "   if (swap_cond == (data[big_idx] < data[sml_idx])) {\n"
+    "       KERNEL_TYPE temp = data[sml_idx];\n"
+    "       data[sml_idx] = data[big_idx];\n"
+    "       data[big_idx] = temp;\n"
+    "   }\n"
+    "}\n";
+    auto src_c_str = src.c_str();
+    auto build_options = std::string("-DKERNEL_TYPE=") + getKernelTypeStr<T>();
+
+    auto prog = clCreateProgramWithSource(ctx, 1, &src_c_str, nullptr, nullptr);
+    auto dev = ctx.device();
+    auto prog_err = clBuildProgram(prog, 1, &m_dev, build_options.c_str(), nullptr, nullptr);
+    if (prog_err == CL_BUILD_PROGRAM_FAILURE) {
+        size_t log_sz;
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_sz);
+        std::vector<char> log(log_sz);
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
+        throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
+    }
+    m_ker = clCreateKernel(prog, "bitonicSort", nullptr);
+    clReleaseProgram(prog);
+}
+```
+`getKernelTypeStr` returns the name of the OpenCL C type that corresponds to `T`. `getKernelExtensionStr` returns the string to enable all extensions that are required to use `T` as a kernel type. OpenCL extensions are various pieces of optional functionality that might not be supported by all implementations. For example, `double` support requires the `cl_khr_fp64` extensions. To require it, the following `#pragma` can be used:
+```
+#pragma OPENCL EXTENSION cl_khr_fp64 : require
+```
+Kernel compilation will now fail if the device doesn't support the `cl_khr_fp64` extension.
+
+Since can we now have multiple compiled kernels, let's add a map to `BSContext` to store them:
+```C++
+class BSContext {
+private:
+    cl_context m_ctx = nullptr;
+    cl_device_id m_dev = nullptr;
+    cl_command_queue m_q = nullptr;
+    std::unordered_map<const char*, cl_kernel> m_kers;
+
+public:
+    BSContext();
+    BSContext(const BSContext&) = delete;
+    BSContext(BSContext&&) = delete;
+    BSContext& operator=(const BSContext&) = delete;
+    BSContext& operator=(BSContext&&) = delete;
+    ~BSContext();
+    cl_context context() const {
+        return m_ctx;
+    }
+    cl_device_id device() const {
+        return m_dev;
+    }
+    cl_command_queue queue() const {
+        return m_q;
+    }
+    template<typename T>
+    cl_kernel kernel();
+
+private:
+    template<typename T>
+    cl_kernel buildKernel();
+};
+
+template<typename T>
+cl_kernel BSContext::kernel() {
+    auto& ker = m_kers[getKernelTypeStr<T>()];
+    if (!ker) {
+        ker = buildKernel<T>();
+    }
+    return ker;
+}
+
+template<typename T>
+cl_kernel BSContext::buildKernel() {
+    auto src =
+    std::string(getKernelExtensionStr<T>()) +
+    "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
+    "__kernel void bitonicSort(__global KERNEL_TYPE* data, uint seq_cnt, uint subseq_cnt) {\n"
+    "   size_t i = get_global_id(0);\n"
+    "   size_t sml_idx = (i & (subseq_cnt - 1)) | ((i & ~(subseq_cnt - 1)) << 1);\n"
+    "   size_t big_idx = sml_idx + subseq_cnt;\n"
+    "   bool swap_cond = !(i & seq_cnt);\n"
+    "   if (swap_cond == (data[big_idx] < data[sml_idx])) {\n"
+    "       KERNEL_TYPE temp = data[sml_idx];\n"
+    "       data[sml_idx] = data[big_idx];\n"
+    "       data[big_idx] = temp;\n"
+    "   }\n"
+    "}\n";
+    auto src_c_str = src.c_str();
+    auto build_options = std::string("-DKERNEL_TYPE=") + getKernelTypeStr<T>();
+
+    auto prog = clCreateProgramWithSource(m_ctx, 1, &src_c_str, nullptr, nullptr);
+    auto prog_err = clBuildProgram(prog, 1, &m_dev, build_options.c_str(), nullptr, nullptr);
+    if (prog_err == CL_BUILD_PROGRAM_FAILURE) {
+        size_t log_sz;
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_sz);
+        std::vector<char> log(log_sz);
+        clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
+        throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
+    }
+
+    auto ker = clCreateKernel(prog, "bitonicSort", nullptr);
+
+    clReleaseProgram(prog);
+
+    return ker;
+}
+```
+
+## Conclusion
+In this, part, we have made our bitonic sort implementation type-generic. It is now more usefull, but it's still limited by the fact that it can only be used sequences whose length is a power of 2. In the next part, we will try to address this.
 
 # Part 3 -- Bitonic sort for non power of 2 lengths
 
