@@ -259,6 +259,126 @@ The complete implementation can be found [here](https://github.com/Attractadore/
 In the next part we will look at how make it usable with types other than `int`.
 
 # Part 2 -- Type generic bitonic sort
+Last time, we implemented bitonic sort in OpenCL. However, the only type that it supports is `int`, so let's change that.
+
+First of all, since static objects are created for every instantiation of a template, let's move our static `BSContext` instance from bitonicSort to a separate getter function:
+```C++
+namespace Detail {
+inline BSContext& getBSContext() {
+    static BSContext ctx;
+    return ctx;
+}
+}
+
+template<typename T>
+void bitonicSort(std::span<T> data) {
+    Detail::BS(Detail::getBSContext(), data);
+}
+```
+
+Let's add a constraint to `bitonicSort` so it can only be called with that have an OpenCL C version. The full list of built-in scalar data types in OpenCL C can be found [here](https://www.khronos.org/registry/OpenCL/sdk/1.2/docs/man/xhtml/scalarDataTypes.html).
+```C++
+template<typename T>
+    requires Detail::IsCLTypeV<T>
+void bitonicSort(std::span<T> data) {
+    Detail::BS(Detail::getBSContext(), data);
+}
+```
+
+Let's take a look at `IsCLTypeV`:
+```C++
+enum class ArithmeticCategory {
+    SignedIntegral,
+    UnsignedIntegral,
+    FloatingPoint,
+    Invalid,
+};
+
+template<typename T>
+constexpr auto ArithmeticCategoryV = [] {
+    // Determine what arithmetic category this type belongs to
+    ...
+}();
+
+template<size_t BitWidth, ArithmeticCategory AC> struct CLTypeRepr { using type = void; };
+
+template<typename T>
+using CLType = CLTypeRepr<sizeof(T) * CHAR_BIT, ArithmeticCategoryV<T>>;
+
+template<typename T>
+using CLTypeT = typename CLType<T>::type;
+
+template<typename T>
+struct IsCLType: std::conditional_t<std::is_same_v<CLTypeT<T>, void>, std::false_type, std::true_type> {};
+
+template<typename T>
+constexpr auto IsCLTypeV = IsCLType<T>::value;
+```
+
+`CLTypeRepr` is used to identify types only by their bit width and arithmetic category. I added the necessary specializations to match all of OpenCL C's built-in types:
+```C++
+using CLChar   = CLTypeRepr<8 , ArithmeticCategory::SignedIntegral>;
+using CLUChar  = CLTypeRepr<8 , ArithmeticCategory::UnsignedIntegral>;
+using CLShort  = CLTypeRepr<16, ArithmeticCategory::SignedIntegral>;
+using CLUShort = CLTypeRepr<16, ArithmeticCategory::UnsignedIntegral>;
+using CLInt    = CLTypeRepr<32, ArithmeticCategory::SignedIntegral>;
+using CLUInt   = CLTypeRepr<32, ArithmeticCategory::UnsignedIntegral>;
+using CLLong   = CLTypeRepr<64, ArithmeticCategory::SignedIntegral>;
+using CLULong  = CLTypeRepr<64, ArithmeticCategory::UnsignedIntegral>;
+using CLHalf   = CLTypeRepr<16, ArithmeticCategory::FloatingPoint>;
+using CLFloat  = CLTypeRepr<32, ArithmeticCategory::FloatingPoint>;
+using CLDouble = CLTypeRepr<64, ArithmeticCategory::FloatingPoint>;
+```
+
+I chose not to rely on the typedefs that OpenCL provides since there is not typedef for `half` as a 16-bit floating-point type (understandable, since there is not standard type for `half` in C++), rather `cl_half` is the same as `cl_ushort`. Another problem is that `cl_long` corresponds to either `long` OR `long long`, not both. This is annoying, since this means that it's not possible to simply specialize `CLType` for all OpenCL typedefs and check its `type` field for `void` to decide whether we were given a valid type.
+
+In OpenCL C, integer and float support is mandatory, while half and double support is optional. So let's allow the user check if they are supported before calling `bitonicSort`:
+```C++
+namespace Detail {
+template<typename T>
+constexpr bool BSTypeSupportedImpl() {
+    return true;
+}
+
+template<>
+inline bool BSTypeSupportedImpl<CLHalf>() {
+    auto& ctx = getBSContext();
+    cl_device_fp_config fp_config;
+    clGetDeviceInfo(ctx.device(), CL_DEVICE_HALF_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);
+    return fp_config;
+}
+
+template<>
+inline bool BSTypeSupportedImpl<CLDouble>() {
+    auto& ctx = getBSContext();
+    cl_device_fp_config fp_config;
+    clGetDeviceInfo(ctx.device(), CL_DEVICE_DOUBLE_FP_CONFIG, sizeof(fp_config), &fp_config, nullptr);
+    return fp_config;
+}
+
+template<typename T>
+constexpr bool BSTypeSupported() {
+    if constexpr (not IsCLTypeV<T>) {
+        return false;
+    }
+    return BSTypeSupportedImpl<CLType<T>>();
+}
+}
+
+template<typename T>
+constexpr bool bitonicSortTypeSupported() {
+    return Detail::BSTypeSupported<T>();
+}
+
+template<typename T>
+    requires Detail::IsCLTypeV<T>
+void bitonicSort(std::span<T> data) {
+    assert(bitonicSortTypeSupported<T>());
+    Detail::BS(Detail::getBSContext(), data);
+}
+```
+
+We do this by calling `clGetDeviceInfo` to retrieve the corresponding half or double precision capability flags. If the flags are not 0, than half or double operations are supported.
 
 # Part 3 -- Bitonic sort for non power of 2 lengths
 
