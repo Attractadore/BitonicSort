@@ -160,7 +160,6 @@ Kernel compilation will now fail if the device doesn't support the `cl_khr_fp64`
 Since can we now have multiple compiled kernels, let's add a map to `BSContext` to store them:
 ```C++
 class BSContext {
-private:
     cl_context m_ctx = nullptr;
     cl_device_id m_dev = nullptr;
     cl_command_queue m_q = nullptr;
@@ -173,15 +172,19 @@ public:
     BSContext& operator=(const BSContext&) = delete;
     BSContext& operator=(BSContext&&) = delete;
     ~BSContext();
+
     cl_context context() const {
         return m_ctx;
     }
+
     cl_device_id device() const {
         return m_dev;
     }
+
     cl_command_queue queue() const {
         return m_q;
     }
+
     template<typename T>
     cl_kernel kernel();
 
