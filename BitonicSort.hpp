@@ -226,7 +226,6 @@ cl_kernel BSContext::buildKernel() {
         clGetProgramBuildInfo(prog, m_dev, CL_PROGRAM_BUILD_LOG, log.size(), log.data(), nullptr);
         throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
     }
-
     auto ker = clCreateKernel(prog, "bitonicSort", nullptr);
 
     clReleaseProgram(prog);
