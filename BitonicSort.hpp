@@ -7,9 +7,10 @@
 #include <cassert>
 #include <climits>
 #include <iterator>
+#include <limits>
 #include <span>
-#include <vector>
 #include <unordered_map>
+#include <vector>
 
 namespace Detail {
 enum class ArithmeticCategory {
@@ -20,48 +21,15 @@ enum class ArithmeticCategory {
 };
 
 template<typename T>
-struct IsBool: std::false_type {};
-
-template<>
-struct IsBool<bool>: std::true_type {};
-
-template<typename T>
-constexpr auto IsBoolV = IsBool<T>::value;
-
-template<typename T>
-struct IsChar: std::false_type {};
-
-template<>
-struct IsChar<char8_t>: std::true_type {};
-
-template<>
-struct IsChar<char16_t>: std::true_type {};
-
-template<>
-struct IsChar<char32_t>: std::true_type {};
-
-template<>
-struct IsChar<wchar_t>: std::true_type {};
-
-template<typename T>
-constexpr auto IsCharV = IsChar<T>::value;
-
-template<typename T>
 constexpr auto ArithmeticCategoryV = [] {
     using enum ArithmeticCategory;
-    if constexpr (IsBoolV<T>) {
-        return Invalid;
-    }
-    if constexpr (IsCharV<T>) {
-        return Invalid;
-    }
     if constexpr (std::is_integral_v<T>) {
         if constexpr (std::is_signed_v<T>) {
             return SignedIntegral;
         }
         return UnsignedIntegral;
     }
-    if constexpr (std::is_floating_point_v<T>) {
+    if constexpr (std::is_floating_point_v<T> and std::numeric_limits<T>::is_iec559) {
         return FloatingPoint;
     }
     return Invalid;
