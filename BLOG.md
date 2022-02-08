@@ -255,7 +255,7 @@ void BS(BSContext& ctx, std::span<T> data) {
 
 ## Conclusion
 We now have a parallel sorting algorithm that runs on an OpenCL device.
-The complete implementation can be found [here](https://github.com/Attractadore/BitonicSort/blob/db916ea56e34d83ca8c4a469478b765edb096c15/BitonicSort.hpp).
+The complete implementation can be found [here](https://github.com/Attractadore/BitonicSort/blob/blog-1/BitonicSort.hpp).
 In the next part we will look at how make it usable with types other than `int`.
 
 # Part 2 -- Type generic bitonic sort
@@ -497,7 +497,9 @@ cl_kernel BSContext::buildKernel() {
 ```
 
 ## Conclusion
-In this, part, we have made our bitonic sort implementation type-generic. It is now more usefull, but it's still limited by the fact that it can only be used sequences whose length is a power of 2. In the next part, we will try to address this.
+In this, part we have made our bitonic sort type-generic.
+The complete implementation can be found [here](https://github.com/Attractadore/BitonicSort/blob/blog-2/BitonicSort.hpp).
+While the algorithm is now more usefull, it's still limited by the fact that it can only be used sequences whose length is a power of 2. In the next part, we will try to address this.
 
 # Part 3 -- Bitonic sort for non power of 2 lengths
 
