@@ -3,11 +3,7 @@
 #include <gtest/gtest.h>
 
 template<typename T>
-void TestGenerated() {
-    if (!bitonicSortTypeSupported<T>()) {
-        return;
-    }
-
+void TestGeneratedPO2() {
     constexpr unsigned min_size = 1u << 0;
     constexpr unsigned max_size = 1u << 20;
 
@@ -19,6 +15,7 @@ void TestGenerated() {
     ASSERT_EQ(data, expected);
     for (unsigned long long i = min_size; i <= max_size; i *= 2) {
         data.resize(i);
+        //std::cout << "PO2 " << data.size() << "\n";
         for (auto& e: data) {
             e = rand();
         }
@@ -27,6 +24,39 @@ void TestGenerated() {
         std::sort(expected.begin(), expected.end());
         ASSERT_EQ(data, expected);
     }
+}
+
+template<typename T>
+void TestGeneratedNonPO2() {
+    constexpr unsigned min_size = 1u << 0;
+    constexpr unsigned max_size = 1u << 20;
+
+    std::vector<T> data, expected;
+    data.reserve(max_size);
+    expected.reserve(max_size);
+    bitonicSort(data.begin(), data.end());
+    std::sort(expected.begin(), expected.end());
+    ASSERT_EQ(data, expected);
+    for (unsigned long long i = min_size, j = 0; i <= max_size; i *= 10, j++) {
+        data.resize(i + j);
+        //std::cout << "NonPO2 " << data.size() << "\n";
+        for (auto& e: data) {
+            e = rand();
+        }
+        expected = data;
+        bitonicSort(data.begin(), data.end());
+        std::sort(expected.begin(), expected.end());
+        ASSERT_EQ(data, expected);
+    }
+}
+
+template<typename T>
+void TestGenerated() {
+    if (!bitonicSortTypeSupported<T>()) {
+        return;
+    }
+    TestGeneratedPO2<T>();
+    TestGeneratedNonPO2<T>();
 }
 
 TEST(TestBitonicSort, TestGeneratedChar) {
