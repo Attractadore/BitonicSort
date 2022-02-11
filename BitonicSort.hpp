@@ -4,6 +4,7 @@
 #endif
 #include <CL/opencl.h>
 
+#include <bit>
 #include <cassert>
 #include <climits>
 #include <iterator>
@@ -203,12 +204,35 @@ cl_kernel BSContext::buildKernel() {
     auto src =
     std::string(getKernelExtensionStr<T>()) +
     "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
-    "__kernel void bitonicSort(__global KERNEL_TYPE* data, uint seq_cnt, uint subseq_cnt) {\n"
+    "__kernel void bitonicSort(\n"
+    "   __global KERNEL_TYPE* data, uint cnt,\n"
+    "   uint seq_cnt, uint subseq_cnt\n"
+    ") {\n"
     "   size_t i = get_global_id(0);\n"
-    "   size_t sml_idx = (i & (subseq_cnt - 1)) | ((i & ~(subseq_cnt - 1)) << 1);\n"
+    "   bool b_ascending = !(i & seq_cnt);\n"
+    "   size_t seq_end = ((i + seq_cnt) & ~(seq_cnt - 1)) * 2;\n"
+    "   size_t pad_cnt = seq_end - cnt;\n"
+    "   bool b_virpad = b_ascending && seq_end > cnt;\n"
+        // If a sequence has a length that is not a power of 2,
+        // virtual padding has to be inserted.
+        // If sorting in ascending order, we virtually insert -inf at the front,
+        // and indices have to be adjusted to account for the disabled comparators.
+        // If sorting in descending order, we virtually insert -inf at the back.
+        // Indices don't have to be adjusted, since all disabled comparators are
+        // at the end.
+    "   if (b_virpad) {\n"
+    "       size_t rem = pad_cnt & (2 * subseq_cnt - 1);\n"
+    "       size_t disable_cnt = min(rem, subseq_cnt) + (pad_cnt - rem) / 2;\n"
+    "       i += disable_cnt;\n"
+    "   }\n"
+    "   size_t block_base = (i & ~(subseq_cnt - 1)) * 2;\n"
+    "   size_t block_offt = i & (subseq_cnt - 1);\n"
+    "   size_t sml_idx = (block_base | block_offt);\n"
+    "   if (b_virpad) {\n"
+    "       sml_idx -= pad_cnt;\n"
+    "   }\n"
     "   size_t big_idx = sml_idx + subseq_cnt;\n"
-    "   bool swap_cond = !(i & seq_cnt);\n"
-    "   if (swap_cond == (data[big_idx] < data[sml_idx])) {\n"
+    "   if (b_ascending == (data[big_idx] < data[sml_idx])) {\n"
     "       KERNEL_TYPE temp = data[sml_idx];\n"
     "       data[sml_idx] = data[big_idx];\n"
     "       data[big_idx] = temp;\n"
@@ -238,13 +262,19 @@ template<typename T>
 inline void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     auto q = ctx.queue();
     auto ker = ctx.kernel<T>();
-    size_t global_sz = cnt / 2;
-    assert((cnt & (cnt - 1)) == 0);
+    auto po2cnt = std::bit_ceil(cnt);
+    auto pad_cnt = po2cnt - cnt;
     clSetKernelArg(ker, 0, sizeof(buf), &buf);
-    for (cl_uint seq_cnt = 1; seq_cnt <= cnt / 2; seq_cnt *= 2) {
+    cl_uint clcnt = cnt;
+    assert(clcnt == cnt);
+    clSetKernelArg(ker, 1, sizeof(clcnt), &clcnt);
+    for (cl_uint seq_cnt = 1; seq_cnt < cnt; seq_cnt *= 2) {
         for (cl_uint subseq_cnt = seq_cnt; subseq_cnt >= 1; subseq_cnt /= 2) {
-            clSetKernelArg(ker, 1, sizeof(seq_cnt), &seq_cnt);
-            clSetKernelArg(ker, 2, sizeof(subseq_cnt), &subseq_cnt);
+            clSetKernelArg(ker, 2, sizeof(seq_cnt), &seq_cnt);
+            clSetKernelArg(ker, 3, sizeof(subseq_cnt), &subseq_cnt);
+            auto rem = pad_cnt & (2 * subseq_cnt - 1);
+            auto disable_cnt = std::min<size_t>(rem, subseq_cnt) + (pad_cnt - rem) / 2;
+            size_t global_sz = po2cnt / 2 - disable_cnt;
             clEnqueueNDRangeKernel(q, ker, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
         }
     }
