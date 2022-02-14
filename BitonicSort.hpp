@@ -203,41 +203,26 @@ template<typename T>
 cl_kernel BSContext::buildKernel() {
     auto src =
     std::string(getKernelExtensionStr<T>()) +
-    "__attribute__((reqd_work_group_size(1, 1, 1)))\n"
-    "__kernel void bitonicSort(\n"
-    "   __global KERNEL_TYPE* data, uint cnt,\n"
-    "   uint seq_cnt, uint subseq_cnt\n"
-    ") {\n"
-    "   size_t i = get_global_id(0);\n"
-    "   bool b_ascending = !(i & seq_cnt);\n"
-    "   size_t seq_end = ((i + seq_cnt) & ~(seq_cnt - 1)) * 2;\n"
-    "   size_t pad_cnt = seq_end - cnt;\n"
-    "   bool b_virpad = b_ascending && seq_end > cnt;\n"
-        // If a sequence has a length that is not a power of 2,
-        // virtual padding has to be inserted.
-        // If sorting in ascending order, we virtually insert -inf at the front,
-        // and indices have to be adjusted to account for the disabled comparators.
-        // If sorting in descending order, we virtually insert -inf at the back.
-        // Indices don't have to be adjusted, since all disabled comparators are
-        // at the end.
-    "   if (b_virpad) {\n"
-    "       size_t rem = pad_cnt & (2 * subseq_cnt - 1);\n"
-    "       size_t disable_cnt = min(rem, subseq_cnt) + (pad_cnt - rem) / 2;\n"
-    "       i += disable_cnt;\n"
-    "   }\n"
-    "   size_t block_base = (i & ~(subseq_cnt - 1)) * 2;\n"
-    "   size_t block_offt = i & (subseq_cnt - 1);\n"
-    "   size_t sml_idx = (block_base | block_offt);\n"
-    "   if (b_virpad) {\n"
-    "       sml_idx -= pad_cnt;\n"
-    "   }\n"
-    "   size_t big_idx = sml_idx + subseq_cnt;\n"
-    "   if (b_ascending == (data[big_idx] < data[sml_idx])) {\n"
-    "       KERNEL_TYPE temp = data[sml_idx];\n"
-    "       data[sml_idx] = data[big_idx];\n"
-    "       data[big_idx] = temp;\n"
-    "   }\n"
-    "}\n";
+    R"(
+    __attribute__((reqd_work_group_size(1, 1, 1)))
+    __kernel void bitonicSort(
+       __global KERNEL_TYPE* data, uint cnt,
+       uint seq_cnt, uint subseq_cnt
+    ) {
+        size_t i = get_global_id(0);
+        uint po2cnt = 1 << (32 - clz(cnt - 1));
+        uint mask = ((2 * i)) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
+        bool b_ascending = !(popcount(mask) & 1);
+        size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
+        size_t block_offt = i & (subseq_cnt - 1);
+        size_t sml_idx = (block_base | block_offt);
+        size_t big_idx = sml_idx + subseq_cnt;
+        if (b_ascending == (data[big_idx] < data[sml_idx])) {
+            KERNEL_TYPE temp = data[sml_idx];
+            data[sml_idx] = data[big_idx];
+            data[big_idx] = temp;
+        }
+    })";
     auto src_c_str = src.c_str();
     auto build_options = std::string("-DKERNEL_TYPE=") + getKernelTypeStr<T>();
 
