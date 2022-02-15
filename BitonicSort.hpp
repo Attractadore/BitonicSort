@@ -355,7 +355,7 @@ Kernel BSContext::buildKernel() {
     })";
     auto src_c_str = src.c_str();
 
-    auto local_sz = 16u;
+    auto local_sz = 256u;
     auto build_options = std::string(" -DKERNEL_TYPE=") + getKernelTypeStr<T>() +
                                      " -DLOCAL_SIZE_X=" + std::to_string(local_sz) +
                                      " -DMIN_VALUE="    + minVStr<T>() +
@@ -385,6 +385,11 @@ Kernel BSContext::buildKernel() {
 }
 
 template<typename T>
+T pad(T x, T m) {
+    return (x / m + (x % m != 0)) * m;
+}
+
+template<typename T>
 void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     auto q = ctx.queue();
     auto ker = ctx.kernel<T>();
@@ -399,7 +404,7 @@ void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     clSetKernelArg(ker.fast, 1, sizeof(clcnt), &clcnt);
     clSetKernelArg(ker.start, 1, sizeof(clcnt), &clcnt);
     {
-        size_t global_sz = (cnt / 2 / ker.local_sz + (cnt / 2 % ker.local_sz != 0)) * ker.local_sz;
+        size_t global_sz = pad(cnt / 2, ker.local_sz);
         clEnqueueNDRangeKernel(q, ker.start, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
     }
     for (cl_uint seq_cnt = 2 * ker.local_sz; seq_cnt < cnt; seq_cnt *= 2) {
@@ -409,13 +414,12 @@ void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
             clSetKernelArg(ker.slow, 3, sizeof(subseq_cnt), &subseq_cnt);
             auto rem = pad_cnt & (2 * subseq_cnt - 1);
             auto disable_cnt = std::min<size_t>(rem, subseq_cnt) + (pad_cnt - rem) / 2;
-            size_t global_sz = po2cnt / 2 - disable_cnt;
-            global_sz = (global_sz / ker.local_sz + (global_sz % ker.local_sz != 0)) * ker.local_sz;
+            size_t global_sz = pad(po2cnt / 2 - disable_cnt, ker.local_sz);
             clEnqueueNDRangeKernel(q, ker.slow, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
         }
         clSetKernelArg(ker.fast, 2, sizeof(seq_cnt), &seq_cnt);
         clSetKernelArg(ker.fast, 3, sizeof(subseq_cnt), &subseq_cnt);
-        size_t global_sz = (cnt / 2 / ker.local_sz + (cnt / 2 % ker.local_sz != 0)) * ker.local_sz;
+        size_t global_sz = pad(cnt / 2, ker.local_sz);
         clEnqueueNDRangeKernel(q, ker.fast, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
     }
 }
