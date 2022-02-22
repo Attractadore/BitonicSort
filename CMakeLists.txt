@@ -11,6 +11,7 @@ target_link_libraries(sorter BitonicSort)
 
 add_executable(BenchBitonicSort BenchBitonicSort.cpp)
 target_link_libraries(BenchBitonicSort BitonicSort tbb)
+target_compile_definitions(BenchBitonicSort PRIVATE MEASURE)
 
 find_package(GTest)
 if (TARGET GTest::gtest_main)

@@ -21,15 +21,11 @@ int main() {
         auto t1 = std::chrono::steady_clock::now();
 
         auto t2 = std::chrono::steady_clock::now();
-#if NDEBUG
         std::sort(sdata.begin(), sdata.end());
-#endif
         auto t3 = std::chrono::steady_clock::now();
 
         auto t4 = std::chrono::steady_clock::now();
-#if NDEBUG
         std::sort(std::execution::par_unseq, pdata.begin(), pdata.end());
-#endif
         auto t5 = std::chrono::steady_clock::now();
 
         auto bs = std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();

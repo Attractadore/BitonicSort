@@ -12,6 +12,11 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <fstream>
+#include <filesystem>
+
+#include <iostream>
+#include <chrono>
 
 namespace Detail {
 enum class ArithmeticCategory {
@@ -106,10 +111,12 @@ struct Kernel {
     cl_kernel slow = nullptr;
     cl_kernel fast = nullptr;
     cl_kernel start = nullptr;
-    size_t local_sz = 0;
+    size_t local_size = 0;
+    size_t num_thread_elems = 0;
+    size_t max_subseq_cnt = 0;
 
     explicit operator bool() const {
-        return slow and fast and start and local_sz;
+        return slow and fast and start;
     }
 };
 
@@ -148,8 +155,11 @@ private:
 };
 
 inline BSContext::BSContext() {
+    auto notify = [] (const char *errinfo, const void *private_info, size_t cb, void *user_data) {
+        std::cerr << "OpenCL error: " << errinfo << "\n";
+    };
     cl_int ctx_err;
-    m_ctx = clCreateContextFromType(nullptr, CL_DEVICE_TYPE_GPU, nullptr, nullptr, &ctx_err);
+    m_ctx = clCreateContextFromType(nullptr, CL_DEVICE_TYPE_GPU, notify, nullptr, &ctx_err);
     if (ctx_err == CL_INVALID_PLATFORM) {
         throw std::runtime_error{"No OpenCL platforms found"};
     }
@@ -159,7 +169,7 @@ inline BSContext::BSContext() {
 
     clGetContextInfo(m_ctx, CL_CONTEXT_DEVICES, sizeof(cl_device_id), &m_dev, nullptr);
 
-    m_q = clCreateCommandQueue(m_ctx, m_dev, 0, nullptr);
+    m_q = clCreateCommandQueue(m_ctx, m_dev, CL_QUEUE_PROFILING_ENABLE, nullptr);
 }
 
 inline BSContext::~BSContext() {
@@ -230,137 +240,80 @@ auto maxVStr() {
     }
 };
 
+struct ProfileEvent {
+    cl_event event;
+    std::string name;
+};
+
+inline auto& getEventVector() {
+    static std::vector<ProfileEvent> events;
+    return events;
+}
+
+template<typename T>
+void measure(T f, std::string_view msg) {
+#if MEASURE
+    auto& pe = getEventVector().emplace_back();
+    pe.name = msg;
+    f(&pe.event);
+#else
+    cl_event e;
+    f(&e);
+#endif
+}
+
+inline void measureFinalize() {
+#if MEASURE
+    size_t fast_run_time = 0;
+    size_t fast_count = 0;
+    for (const auto& pe: getEventVector()) {
+        cl_ulong enque_time, submit_time, start_time, end_time;
+        clGetEventProfilingInfo(pe.event, CL_PROFILING_COMMAND_QUEUED, sizeof(enque_time), &enque_time, nullptr);
+        clGetEventProfilingInfo(pe.event, CL_PROFILING_COMMAND_SUBMIT, sizeof(submit_time), &submit_time, nullptr);
+        clGetEventProfilingInfo(pe.event, CL_PROFILING_COMMAND_START, sizeof(start_time), &start_time, nullptr);
+        clGetEventProfilingInfo(pe.event, CL_PROFILING_COMMAND_END, sizeof(end_time), &end_time, nullptr);
+        auto in_queue_time = (start_time - enque_time) / 1000;
+        auto run_time = (end_time - start_time) / 1000;
+        std::cout << "Event \"" << pe.name << "\" Running: " << run_time << ", In queue: " << in_queue_time << "\n";
+        if (pe.name.starts_with("Run fast kernel")) {
+            fast_run_time += run_time;
+            fast_count++;
+        }
+    }
+    std::cout << "Fast kernel runtime is " << (fast_count ? (fast_run_time / fast_count): 0) << "\n";
+#endif
+}
+
+inline std::string getKernelSourceStr() {
+    auto file_path = "kernels.clc";
+    std::ifstream f(file_path, std::ios::binary);
+    auto sz = std::filesystem::file_size(file_path);
+    std::string str(sz, '\0');
+    f.read(str.data(), sz);
+    return str;
+}
+
 template<typename T>
 Kernel BSContext::buildKernel() {
-    auto src =
-    std::string(getKernelExtensionStr<T>()) +
-    R"(
-    #ifndef LOCAL_SIZE_X
-    #define LOCAL_SIZE_X 256
-    #endif
-    enum { local_size_x = LOCAL_SIZE_X };
+    auto src = std::string(getKernelExtensionStr<T>()) + getKernelSourceStr();;
 
-    void loadCache(
-        __global const KERNEL_TYPE* data, uint cnt,
-        __local KERNEL_TYPE* cache, KERNEL_TYPE pad_value
-    ) {
-        size_t i = 2 * get_global_id(0);
-        size_t j = 2 * get_local_id(0);
-        cache[j    ] = (i     < cnt) ? data[i    ]: pad_value;
-        cache[j + 1] = (i + 1 < cnt) ? data[i + 1]: pad_value;
-    }
+    size_t max_local_size;
+    cl_ulong max_slm_size_bytes;
+    clGetDeviceInfo(m_dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_local_size), &max_local_size, nullptr);
+    clGetDeviceInfo(m_dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(max_slm_size_bytes), &max_slm_size_bytes, nullptr);
+    auto slm_size_bytes = max_slm_size_bytes / 8;
+    auto slm_size = slm_size_bytes / sizeof(T);
+    auto local_size = std::min(slm_size / 2, max_local_size);
+    auto max_subseq_cnt = slm_size / 2;
+    auto num_thread_elems = max_subseq_cnt / local_size;
 
-    void storeCache(
-        __global KERNEL_TYPE* data, uint cnt,
-        __local const KERNEL_TYPE* cache
-    ) {
-        size_t i = 2 * get_global_id(0);
-        size_t j = 2 * get_local_id(0);
-        if (i     < cnt) {
-            data[i    ] = cache[j    ];
-        }
-        if (i + 1 < cnt) {
-            data[i + 1] = cache[j + 1];
-        }
-    }
+    auto build_options = std::string(" -DKERNEL_TYPE=")         + getKernelTypeStr<T>() +
+                                     " -DLOCAL_SIZE="           + std::to_string(local_size) +
+                                     " -DLOCAL_MEM_SIZE_BYTES=" + std::to_string(slm_size_bytes) +
+                                     " -DMIN_VALUE="            + minVStr<T>() +
+                                     " -DMAX_VALUE="            + maxVStr<T>();
 
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSortLocal(
-       __global KERNEL_TYPE* data, uint cnt,
-       uint seq_cnt, uint subseq_cnt
-    ) {
-        __local KERNEL_TYPE cache[2 * local_size_x];
-        size_t j = get_global_id(0);
-        uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * j)) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
-        bool b_ascending = !(popcount(mask) & 1);
-        KERNEL_TYPE pad_value = b_ascending ? MAX_VALUE: MIN_VALUE;
-        loadCache(data, cnt, cache, pad_value);
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        size_t i = get_local_id(0);
-        for (; subseq_cnt; subseq_cnt /= 2) {
-            size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
-            size_t block_offt = i & (subseq_cnt - 1);
-            size_t sml_idx = block_base | block_offt;
-            size_t big_idx = sml_idx + subseq_cnt;
-            if (b_ascending == (cache[big_idx] < cache[sml_idx])) {
-                KERNEL_TYPE temp = cache[sml_idx];
-                cache[sml_idx] = cache[big_idx];
-                cache[big_idx] = temp;
-            }
-            barrier(CLK_LOCAL_MEM_FENCE);
-        }
-
-        storeCache(data, cnt, cache);
-    };
-
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSortFastStart(
-       __global KERNEL_TYPE* data, uint cnt
-    ) {
-        __local KERNEL_TYPE cache[2 * local_size_x];
-        size_t j = get_global_id(0);
-        uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * j)) | (2 * local_size_x - 1) | (~(po2cnt - 1));
-        bool b_ascending_pad = !(popcount(mask) & 1);
-        KERNEL_TYPE pad_value = b_ascending_pad ? MAX_VALUE: MIN_VALUE;
-        loadCache(data, cnt, cache, pad_value);
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        size_t i = get_local_id(0);
-        mask = ((2 * j)) | (~(po2cnt - 1));
-        bool b_ascending = !(popcount(mask) & 1);
-        for (uint seq_cnt = 1; seq_cnt <= local_size_x; seq_cnt *= 2) {
-            bool b_bit_already_set = mask & seq_cnt;
-            b_ascending = b_ascending == b_bit_already_set;
-            for (uint subseq_cnt = seq_cnt; subseq_cnt; subseq_cnt /= 2) {
-                size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
-                size_t block_offt = i & (subseq_cnt - 1);
-                size_t sml_idx = block_base | block_offt;
-                size_t big_idx = sml_idx + subseq_cnt;
-                if (b_ascending == (cache[big_idx] < cache[sml_idx])) {
-                    KERNEL_TYPE temp = cache[sml_idx];
-                    cache[sml_idx] = cache[big_idx];
-                    cache[big_idx] = temp;
-                }
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-        }
-
-        storeCache(data, cnt, cache);
-    };
-
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSort(
-       __global KERNEL_TYPE* data, uint cnt,
-       uint seq_cnt, uint subseq_cnt
-    ) {
-        size_t i = get_global_id(0);
-        uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * i)) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
-        bool b_ascending = !(popcount(mask) & 1);
-        size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
-        size_t block_offt = i & (subseq_cnt - 1);
-        size_t sml_idx = block_base | block_offt;
-        size_t big_idx = sml_idx + subseq_cnt;
-        bool b_sort = sml_idx < cnt && big_idx < cnt;
-        if (b_sort) {
-            if (b_ascending == (data[big_idx] < data[sml_idx])) {
-                KERNEL_TYPE temp = data[sml_idx];
-                data[sml_idx] = data[big_idx];
-                data[big_idx] = temp;
-            }
-        }
-    })";
     auto src_c_str = src.c_str();
-
-    auto local_sz = 256u;
-    auto build_options = std::string(" -DKERNEL_TYPE=") + getKernelTypeStr<T>() +
-                                     " -DLOCAL_SIZE_X=" + std::to_string(local_sz) +
-                                     " -DMIN_VALUE="    + minVStr<T>() +
-                                     " -DMAX_VALUE="    + maxVStr<T>();
-
     auto prog = clCreateProgramWithSource(m_ctx, 1, &src_c_str, nullptr, nullptr);
     auto prog_err = clBuildProgram(prog, 1, &m_dev, build_options.c_str(), nullptr, nullptr);
     if (prog_err == CL_BUILD_PROGRAM_FAILURE) {
@@ -380,13 +333,20 @@ Kernel BSContext::buildKernel() {
         .slow = slow_ker,
         .fast = fast_ker,
         .start = start_ker,
-        .local_sz = local_sz,
+        .local_size = local_size,
+        .num_thread_elems = num_thread_elems,
+        .max_subseq_cnt = max_subseq_cnt,
     };
 }
 
 template<typename T>
+T ceilDiv(T top, T bot) {
+    return top / bot + (top % bot != 0);
+}
+
+template<typename T>
 T pad(T x, T m) {
-    return (x / m + (x % m != 0)) * m;
+    return ceilDiv(x, m) * m;
 }
 
 template<typename T>
@@ -403,24 +363,38 @@ void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     clSetKernelArg(ker.slow, 1, sizeof(clcnt), &clcnt);
     clSetKernelArg(ker.fast, 1, sizeof(clcnt), &clcnt);
     clSetKernelArg(ker.start, 1, sizeof(clcnt), &clcnt);
-    {
-        size_t global_sz = pad(cnt / 2, ker.local_sz);
-        clEnqueueNDRangeKernel(q, ker.start, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
-    }
-    for (cl_uint seq_cnt = 2 * ker.local_sz; seq_cnt < cnt; seq_cnt *= 2) {
+#if 1
+    measure([&] (cl_event* e) {
+        size_t global_sz = pad(ceilDiv(cnt / 2, ker.num_thread_elems), ker.local_size);
+        clEnqueueNDRangeKernel(q, ker.start, 1, nullptr, &global_sz, nullptr, 0, nullptr, e);
+    }, "Run start kernel");
+    for (cl_uint seq_cnt = 2 * ker.max_subseq_cnt; seq_cnt < cnt; seq_cnt *= 2) {
+#else
+    for (cl_uint seq_cnt = 1; seq_cnt < cnt; seq_cnt *= 2) {
+#endif
         cl_uint subseq_cnt = seq_cnt;
-        for (; subseq_cnt > ker.local_sz; subseq_cnt /= 2) {
+#if 1
+        for (; subseq_cnt > ker.max_subseq_cnt; subseq_cnt /= 2) {
+#else
+        for (; subseq_cnt; subseq_cnt /= 2) {
+#endif
             clSetKernelArg(ker.slow, 2, sizeof(seq_cnt), &seq_cnt);
             clSetKernelArg(ker.slow, 3, sizeof(subseq_cnt), &subseq_cnt);
             auto rem = pad_cnt & (2 * subseq_cnt - 1);
             auto disable_cnt = std::min<size_t>(rem, subseq_cnt) + (pad_cnt - rem) / 2;
-            size_t global_sz = pad(po2cnt / 2 - disable_cnt, ker.local_sz);
-            clEnqueueNDRangeKernel(q, ker.slow, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
+            size_t global_sz = po2cnt / 2 - disable_cnt;
+            measure([&] (cl_event* e) {
+                clEnqueueNDRangeKernel(q, ker.slow, 1, nullptr, &global_sz, nullptr, 0, nullptr, e);
+            }, std::string("Run slow kernel for " + std::to_string(seq_cnt) + "/" + std::to_string(subseq_cnt)));
         }
+#if 1
         clSetKernelArg(ker.fast, 2, sizeof(seq_cnt), &seq_cnt);
         clSetKernelArg(ker.fast, 3, sizeof(subseq_cnt), &subseq_cnt);
-        size_t global_sz = pad(cnt / 2, ker.local_sz);
-        clEnqueueNDRangeKernel(q, ker.fast, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
+        size_t global_sz = pad(ceilDiv(cnt / 2, ker.num_thread_elems), ker.local_size);
+        measure([&] (cl_event* e) {
+            clEnqueueNDRangeKernel(q, ker.fast, 1, nullptr, &global_sz, nullptr, 0, nullptr, e);
+        }, std::string("Run fast kernel for " + std::to_string(seq_cnt) + "/" + std::to_string(subseq_cnt)));
+#endif
     }
 }
 
@@ -429,6 +403,7 @@ void BS(BSContext& ctx, std::span<T> data) {
     auto buf = clCreateBuffer(ctx.context(), CL_MEM_COPY_HOST_PTR, data.size_bytes(), data.data(), nullptr);
     BSRunKernel<T>(ctx, buf, data.size());
     clEnqueueReadBuffer(ctx.queue(), buf, true, 0, data.size_bytes(), data.data(), 0, nullptr, nullptr);
+    measureFinalize();
     clReleaseMemObject(buf);
 }
 }

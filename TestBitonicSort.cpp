@@ -15,7 +15,7 @@ void TestGeneratedPO2() {
     ASSERT_EQ(data, expected);
     for (unsigned long long i = min_size; i <= max_size; i *= 2) {
         data.resize(i);
-        //std::cout << "PO2 " << data.size() << "\n";
+        // std::cout << "PO2 " << data.size() << "\n";
         for (auto& e: data) {
             e = rand();
         }

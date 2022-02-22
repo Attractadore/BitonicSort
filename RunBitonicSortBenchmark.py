@@ -11,8 +11,8 @@ def main(argv) -> None:
         print("Usage: {0} [BenchProgram]".format(argv[0]))
     prog = argv[1]
 
-    min_size: int = 1 << 22
-    max_size: int = 1 << 22
+    min_size: int = 1 << 26
+    max_size: int = 1 << 26
 
     data = getData(2 * max_size - min_size)
 

@@ -1,0 +1,232 @@
+#define TIME_KERNELS 0
+
+__kernel void bitonicSort(
+   __global KERNEL_TYPE* data, uint cnt,
+   uint seq_cnt, uint subseq_cnt
+) {
+#if !TIME_KERNELS
+    size_t i = get_global_id(0);
+    uint po2cnt = 1 << (32 - clz(cnt - 1));
+    uint mask = (2 * i) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
+    bool b_ascending = !(popcount(mask) & 1);
+    size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
+    size_t block_offt = i & (subseq_cnt - 1);
+    size_t sml_idx = block_base + block_offt;
+    size_t big_idx = sml_idx + subseq_cnt;
+    bool b_sort = big_idx < cnt;
+    if (b_sort) {
+        KERNEL_TYPE data_sml = data[sml_idx];
+        KERNEL_TYPE data_big = data[big_idx];
+        bool b_swap = b_ascending == (data_big < data_sml);
+        if (b_swap) {
+            KERNEL_TYPE temp = data_sml;
+            data[sml_idx] = data_big;
+            data[big_idx] = temp;
+        }
+    }
+#endif
+}
+
+#define LOCAL_MEM_SIZE  (LOCAL_MEM_SIZE_BYTES / sizeof(KERNEL_TYPE))
+#define THREAD_ELEMENTS (LOCAL_MEM_SIZE / 2 / LOCAL_SIZE)
+
+void loadCache(__global const KERNEL_TYPE* data, size_t cnt, __local KERNEL_TYPE* cache, uint seq_cnt) {
+    for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+        size_t cidx = 2 * (k * LOCAL_SIZE + get_local_id(0));
+        size_t base_didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0));
+        size_t didx = base_didx + cidx;
+
+        uint po2cnt = 1 << (32 - clz(cnt - 1));
+        uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+        bool b_ascending = !(popcount(mask) & 1);
+
+        KERNEL_TYPE pad_value = b_ascending ? MAX_VALUE: MIN_VALUE;
+        cache[cidx    ] = (didx     < cnt) ? data[didx    ]: pad_value;
+        cache[cidx + 1] = (didx + 1 < cnt) ? data[didx + 1]: pad_value;
+    }
+}
+
+void storeCache(__global KERNEL_TYPE* data, size_t cnt, __local const KERNEL_TYPE* cache) {
+    for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+        size_t cidx = 2 * (k * LOCAL_SIZE + get_local_id(0));
+        size_t base_didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0));
+        size_t didx = base_didx + cidx;
+        if (didx     < cnt) {
+            data[didx    ] = cache[cidx];
+        }
+        if (didx + 1 < cnt) {
+            data[didx + 1] = cache[cidx + 1];
+        }
+    }
+}
+
+__attribute__((reqd_work_group_size(LOCAL_SIZE, 1, 1)))
+__kernel void bitonicSortLocal(
+   __global KERNEL_TYPE* data, uint cnt,
+   uint seq_cnt, uint subseq_cnt
+) {
+#if !TIME_KERNELS
+#if 0
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    size_t i = get_local_id(0);
+    size_t j = get_global_id(0);
+    size_t base_j = j - i;
+    uint po2cnt = 1 << (32 - clz(cnt - 1));
+
+    bool b_ascendings[THREAD_ELEMENTS];
+    {
+        size_t base_didx = 2 * THREAD_ELEMENTS * base_j;
+        for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+            size_t cidx = 2 * (k * LOCAL_SIZE + i);
+            size_t didx = base_didx + cidx;
+
+            uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+            bool b_ascending = !(popcount(mask) & 1);
+            b_ascendings[k] = b_ascending;
+
+            KERNEL_TYPE pad_value = b_ascending ? MAX_VALUE: MIN_VALUE;
+            cache[cidx    ] = (didx     < cnt) ? data[didx    ]: pad_value;
+            cache[cidx + 1] = (didx + 1 < cnt) ? data[didx + 1]: pad_value;
+        }
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (; subseq_cnt; subseq_cnt /= 2) {
+        for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+            bool b_ascending = b_ascendings[k];
+            size_t ti = k * LOCAL_SIZE + i;
+            size_t block_base = (ti & ~(subseq_cnt - 1)) * 2;
+            size_t block_offt = ti & (subseq_cnt - 1);
+            size_t sml_idx = block_base + block_offt;
+            size_t big_idx = sml_idx + subseq_cnt;
+            KERNEL_TYPE cache_sml = cache[sml_idx];
+            KERNEL_TYPE cache_big = cache[big_idx];
+            if (b_ascending == (cache_big < cache_sml)) {
+                KERNEL_TYPE temp = cache_sml;
+                cache[sml_idx] = cache_big;
+                cache[big_idx] = temp;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    {
+        size_t base_didx = 2 * THREAD_ELEMENTS * base_j;
+        for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+            size_t cidx = 2 * (k * LOCAL_SIZE + i);
+            size_t didx = base_didx + cidx;
+            if (didx     < cnt) {
+                data[didx    ] = cache[cidx];
+            }
+            if (didx + 1 < cnt) {
+                data[didx + 1] = cache[cidx + 1];
+            }
+        }
+    }
+#else
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    loadCache(data, cnt, cache, seq_cnt);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (; subseq_cnt; subseq_cnt /= 2) {
+        for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+            size_t ti = k * LOCAL_SIZE + get_local_id(0);
+            size_t block_base = (ti & ~(subseq_cnt - 1)) * 2;
+            size_t block_offt = ti & (subseq_cnt - 1);
+            size_t sml_idx = block_base + block_offt;
+            size_t big_idx = block_base + block_offt + subseq_cnt;
+
+            size_t didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0)) + sml_idx;
+            uint po2cnt = 1 << (32 - clz(cnt - 1));
+            uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+            bool b_ascending = !(popcount(mask) & 1);
+
+            KERNEL_TYPE cache_sml = cache[sml_idx];
+            KERNEL_TYPE cache_big = cache[big_idx];
+            if (b_ascending == (cache_big < cache_sml)) {
+                KERNEL_TYPE temp = cache_sml;
+                cache[sml_idx] = cache_big;
+                cache[big_idx] = temp;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    storeCache(data, cnt, cache);
+#endif
+#endif
+};
+
+__attribute__((reqd_work_group_size(LOCAL_SIZE, 1, 1)))
+__kernel void bitonicSortFastStart(
+   __global KERNEL_TYPE* data, uint cnt
+) {
+#if !TIME_KERNELS
+#if 0
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    loadCache(data, cnt, cache, LOCAL_MEM_SIZE / 2);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint seq_cnt = 1; seq_cnt < LOCAL_MEM_SIZE; seq_cnt *= 2) {
+        for (uint subseq_cnt = seq_cnt; subseq_cnt; subseq_cnt /= 2) {
+            for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+                size_t ti = k * LOCAL_SIZE + get_local_id(0);
+                size_t block_base = (ti & ~(subseq_cnt - 1)) * 2;
+                size_t block_offt = ti & (subseq_cnt - 1);
+                size_t sml_idx = block_base + block_offt;
+                size_t big_idx = block_base + block_offt + subseq_cnt;
+
+                size_t didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0)) + sml_idx;
+                uint po2cnt = 1 << (32 - clz(cnt - 1));
+                uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+                bool b_ascending = !(popcount(mask) & 1);
+
+                KERNEL_TYPE cache_sml = cache[sml_idx];
+                KERNEL_TYPE cache_big = cache[big_idx];
+                if (b_ascending == (cache_big < cache_sml)) {
+                    KERNEL_TYPE temp = cache_sml;
+                    cache[sml_idx] = cache_big;
+                    cache[big_idx] = temp;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    storeCache(data, cnt, cache);
+#else
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    loadCache(data, cnt, cache, LOCAL_MEM_SIZE / 2);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint seq_cnt = 1; seq_cnt < LOCAL_MEM_SIZE; seq_cnt *= 2) {
+        for (uint subseq_cnt = seq_cnt; subseq_cnt; subseq_cnt /= 2) {
+            for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+                size_t ti = k * LOCAL_SIZE + get_local_id(0);
+                size_t block_base = (ti & ~(subseq_cnt - 1)) * 2;
+                size_t block_offt = ti & (subseq_cnt - 1);
+                size_t sml_idx = block_base + block_offt;
+                size_t big_idx = block_base + block_offt + subseq_cnt;
+
+                size_t didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0)) + sml_idx;
+                uint po2cnt = 1 << (32 - clz(cnt - 1));
+                uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+                bool b_ascending = !(popcount(mask) & 1);
+
+                KERNEL_TYPE cache_sml = cache[sml_idx];
+                KERNEL_TYPE cache_big = cache[big_idx];
+                if (b_ascending == (cache_big < cache_sml)) {
+                    KERNEL_TYPE temp = cache_sml;
+                    cache[sml_idx] = cache_big;
+                    cache[big_idx] = temp;
+                }
+            }
+            barrier(CLK_LOCAL_MEM_FENCE);
+        }
+    }
+
+    storeCache(data, cnt, cache);
+
+#endif
+#endif
+};
