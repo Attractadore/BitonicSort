@@ -150,16 +150,41 @@ private:
 };
 
 inline BSContext::BSContext() {
-    cl_int ctx_err;
-    m_ctx = clCreateContextFromType(nullptr, CL_DEVICE_TYPE_GPU, nullptr, nullptr, &ctx_err);
-    if (ctx_err == CL_INVALID_PLATFORM) {
-        throw std::runtime_error{"No OpenCL platforms found"};
+    cl_uint num_plats;
+    clGetPlatformIDs(0, nullptr, &num_plats);
+    std::vector<cl_platform_id> plats(num_plats);
+    clGetPlatformIDs(plats.size(), plats.data(), nullptr);
+
+    size_t num_devs = 0;
+    for (const auto& p: plats) {
+        cl_uint n;
+        clGetDeviceIDs(p, CL_DEVICE_TYPE_ALL, 0, nullptr, &n);
+        num_devs += n;
     }
-    if (ctx_err == CL_DEVICE_NOT_FOUND) {
+    std::vector<cl_device_id> devs(num_devs);
+    if (devs.empty()) {
         throw std::runtime_error{"No OpenCL devices found"};
     }
+    {
+        cl_device_id* out = devs.data();
+        for (const auto& p: plats) {
+            cl_uint n;
+            clGetDeviceIDs(p, CL_DEVICE_TYPE_ALL, devs.size(), out, &n);
+            out += n;
+        }
+    }
 
-    clGetContextInfo(m_ctx, CL_CONTEXT_DEVICES, sizeof(cl_device_id), &m_dev, nullptr);
+    m_dev = devs[0];
+    for (const auto& d: devs) {
+        cl_device_type t;
+        clGetDeviceInfo(d, CL_DEVICE_TYPE, sizeof(t), &t, nullptr);
+        if (t == CL_DEVICE_TYPE_GPU) {
+            m_dev = d;
+            break;
+        }
+    }
+
+    m_ctx = clCreateContext(nullptr, 1, &m_dev, nullptr, nullptr, nullptr);
 
     m_q = clCreateCommandQueue(m_ctx, m_dev, 0, nullptr);
 }
