@@ -91,10 +91,10 @@ constexpr const char* getKernelTypeStr() { return getKernelTypeStrImpl<CLType<T>
 
 template<typename T> constexpr const char* getKernelExtensionStrImpl() { return ""; }
 template<> inline constexpr const char* getKernelExtensionStrImpl<CLHalf>() {
-    return "#pragma OPENCL EXTENSION cl_khr_fp16 : require\n";
+    return "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n";
 }
 template<> inline constexpr const char* getKernelExtensionStrImpl<CLDouble>() {
-    return "#pragma OPENCL EXTENSION cl_khr_fp64 : require\n";
+    return "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n";
 }
 
 template<typename T>
@@ -106,10 +106,12 @@ struct Kernel {
     cl_kernel slow = nullptr;
     cl_kernel fast = nullptr;
     cl_kernel start = nullptr;
-    size_t local_sz = 0;
+    size_t local_size = 0;
+    size_t num_thread_elems = 0;
+    size_t max_subseq_cnt = 0;
 
     explicit operator bool() const {
-        return slow and fast and start and local_sz;
+        return slow and fast and start;
     }
 };
 
@@ -212,155 +214,186 @@ const Kernel& BSContext::kernel() {
 
 template<typename T>
 auto minVStr() {
-    if constexpr (std::is_floating_point_v<T>) {
-        return "\"(-1.0 / 0.0)\"";
-    }
-    else {
-        return std::to_string(std::numeric_limits<T>::min());
-    }
-};
+    return std::to_string(std::numeric_limits<T>::min());
+}
+
+template<>
+inline auto minVStr<float>() {
+    return "(-HUGE_VALF)";
+}
+
+template<>
+inline auto minVStr<double>() {
+    return "(-HUGE_VAL)";
+}
 
 template<typename T>
 auto maxVStr() {
-    if constexpr (std::is_floating_point_v<T>) {
-        return "\"(1.0 / 0.0)\"";
-    }
-    else {
-        return std::to_string(std::numeric_limits<T>::max());
-    }
-};
+    return std::to_string(std::numeric_limits<T>::max());
+}
 
-template<typename T>
-Kernel BSContext::buildKernel() {
-    auto src =
-    std::string(getKernelExtensionStr<T>()) +
-    R"(
-    #ifndef LOCAL_SIZE_X
-    #define LOCAL_SIZE_X 256
-    #endif
-    enum { local_size_x = LOCAL_SIZE_X };
+template<>
+inline auto maxVStr<float>() {
+    return "HUGE_VALF";
+}
 
-    void loadCache(
-        __global const KERNEL_TYPE* data, uint cnt,
-        __local KERNEL_TYPE* cache, KERNEL_TYPE pad_value
-    ) {
-        size_t i = 2 * get_global_id(0);
-        size_t j = 2 * get_local_id(0);
-        cache[j    ] = (i     < cnt) ? data[i    ]: pad_value;
-        cache[j + 1] = (i + 1 < cnt) ? data[i + 1]: pad_value;
+template<>
+inline auto maxVStr<double>() {
+    return "HUGE_VAL";
+}
+
+inline std::string getKernelSourceStr() {
+return R"(
+__kernel void bitonicSort(
+   __global KERNEL_TYPE* data, uint cnt,
+   uint seq_cnt, uint subseq_cnt
+) {
+    size_t i = get_global_id(0);
+    uint po2cnt = 1 << (32 - clz(cnt - 1));
+    uint mask = (2 * i) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
+    bool b_ascending = !(popcount(mask) & 1);
+    size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
+    size_t block_offt = i & (subseq_cnt - 1);
+    size_t sml_idx = block_base + block_offt;
+    size_t big_idx = sml_idx + subseq_cnt;
+    KERNEL_TYPE data_sml = data[sml_idx];
+    KERNEL_TYPE data_big = data[big_idx];
+    if (b_ascending == (data_big < data_sml)) {
+        KERNEL_TYPE temp = data_sml;
+        data[sml_idx] = data_big;
+        data[big_idx] = temp;
     }
+}
 
-    void storeCache(
-        __global KERNEL_TYPE* data, uint cnt,
-        __local const KERNEL_TYPE* cache
-    ) {
-        size_t i = 2 * get_global_id(0);
-        size_t j = 2 * get_local_id(0);
-        if (i     < cnt) {
-            data[i    ] = cache[j    ];
-        }
-        if (i + 1 < cnt) {
-            data[i + 1] = cache[j + 1];
-        }
-    }
+#define LOCAL_MEM_SIZE  (LOCAL_MEM_SIZE_BYTES / sizeof(KERNEL_TYPE))
+#define THREAD_ELEMENTS (LOCAL_MEM_SIZE / 2 / LOCAL_SIZE)
 
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSortLocal(
-       __global KERNEL_TYPE* data, uint cnt,
-       uint seq_cnt, uint subseq_cnt
-    ) {
-        __local KERNEL_TYPE cache[2 * local_size_x];
-        size_t j = get_global_id(0);
+void loadCache(__global const KERNEL_TYPE* data, size_t cnt, __local KERNEL_TYPE* cache, uint seq_cnt) {
+    for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+        size_t cidx = 2 * (k * LOCAL_SIZE + get_local_id(0));
+        size_t base_didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0));
+        size_t didx = base_didx + cidx;
+
         uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * j)) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
+        uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
         bool b_ascending = !(popcount(mask) & 1);
-        KERNEL_TYPE pad_value = b_ascending ? MAX_VALUE: MIN_VALUE;
-        loadCache(data, cnt, cache, pad_value);
-        barrier(CLK_LOCAL_MEM_FENCE);
 
-        size_t i = get_local_id(0);
-        for (; subseq_cnt; subseq_cnt /= 2) {
+        KERNEL_TYPE pad_value = b_ascending ? MAX_VALUE: MIN_VALUE;
+        cache[cidx    ] = (didx     < cnt) ? data[didx    ]: pad_value;
+        cache[cidx + 1] = (didx + 1 < cnt) ? data[didx + 1]: pad_value;
+    }
+}
+
+void storeCache(__global KERNEL_TYPE* data, size_t cnt, __local const KERNEL_TYPE* cache) {
+    for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+        size_t cidx = 2 * (k * LOCAL_SIZE + get_local_id(0));
+        size_t base_didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0));
+        size_t didx = base_didx + cidx;
+        if (didx     < cnt) {
+            data[didx    ] = cache[cidx];
+        }
+        if (didx + 1 < cnt) {
+            data[didx + 1] = cache[cidx + 1];
+        }
+    }
+}
+
+__attribute__((reqd_work_group_size(LOCAL_SIZE, 1, 1)))
+__kernel void bitonicSortFast(
+   __global KERNEL_TYPE* data, uint cnt,
+   uint seq_cnt, uint subseq_cnt
+) {
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    loadCache(data, cnt, cache, seq_cnt);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    size_t didx = 2 * THREAD_ELEMENTS * get_global_id(0);
+    uint po2cnt = 1 << (32 - clz(cnt - 1));
+    uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+    bool b_ascending = !(popcount(mask) & 1);
+
+    for (; subseq_cnt; subseq_cnt /= 2) {
+        for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+            size_t i = k * LOCAL_SIZE + get_local_id(0);
             size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
             size_t block_offt = i & (subseq_cnt - 1);
-            size_t sml_idx = block_base | block_offt;
+            size_t sml_idx = block_base + block_offt;
             size_t big_idx = sml_idx + subseq_cnt;
-            if (b_ascending == (cache[big_idx] < cache[sml_idx])) {
-                KERNEL_TYPE temp = cache[sml_idx];
-                cache[sml_idx] = cache[big_idx];
+
+            KERNEL_TYPE cache_sml = cache[sml_idx];
+            KERNEL_TYPE cache_big = cache[big_idx];
+            if (b_ascending == (cache_big < cache_sml)) {
+                KERNEL_TYPE temp = cache_sml;
+                cache[sml_idx] = cache_big;
                 cache[big_idx] = temp;
+            }
+        }
+        barrier(CLK_LOCAL_MEM_FENCE);
+    }
+
+    storeCache(data, cnt, cache);
+};
+
+__attribute__((reqd_work_group_size(LOCAL_SIZE, 1, 1)))
+__kernel void bitonicSortStart(
+   __global KERNEL_TYPE* data, uint cnt
+) {
+    __local KERNEL_TYPE cache[LOCAL_MEM_SIZE];
+    loadCache(data, cnt, cache, LOCAL_MEM_SIZE / 2);
+    barrier(CLK_LOCAL_MEM_FENCE);
+
+    for (uint seq_cnt = 1; seq_cnt < LOCAL_MEM_SIZE; seq_cnt *= 2) {
+        for (uint subseq_cnt = seq_cnt; subseq_cnt; subseq_cnt /= 2) {
+            for (uint k = 0; k < THREAD_ELEMENTS; k++) {
+                size_t ti = k * LOCAL_SIZE + get_local_id(0);
+                size_t block_base = (ti & ~(subseq_cnt - 1)) * 2;
+                size_t block_offt = ti & (subseq_cnt - 1);
+                size_t sml_idx = block_base + block_offt;
+                size_t big_idx = block_base + block_offt + subseq_cnt;
+
+                size_t didx = 2 * THREAD_ELEMENTS * (get_global_id(0) - get_local_id(0)) + sml_idx;
+                uint po2cnt = 1 << (32 - clz(cnt - 1));
+                uint mask = ~(po2cnt - 1) | didx | (2 * seq_cnt - 1);
+                bool b_ascending = !(popcount(mask) & 1);
+
+                KERNEL_TYPE cache_sml = cache[sml_idx];
+                KERNEL_TYPE cache_big = cache[big_idx];
+                if (b_ascending == (cache_big < cache_sml)) {
+                    KERNEL_TYPE temp = cache_sml;
+                    cache[sml_idx] = cache_big;
+                    cache[big_idx] = temp;
+                }
             }
             barrier(CLK_LOCAL_MEM_FENCE);
         }
+    }
 
-        storeCache(data, cnt, cache);
-    };
+    storeCache(data, cnt, cache);
+};
+)";
+}
 
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSortFastStart(
-       __global KERNEL_TYPE* data, uint cnt
-    ) {
-        __local KERNEL_TYPE cache[2 * local_size_x];
-        size_t j = get_global_id(0);
-        uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * j)) | (2 * local_size_x - 1) | (~(po2cnt - 1));
-        bool b_ascending_pad = !(popcount(mask) & 1);
-        KERNEL_TYPE pad_value = b_ascending_pad ? MAX_VALUE: MIN_VALUE;
-        loadCache(data, cnt, cache, pad_value);
-        barrier(CLK_LOCAL_MEM_FENCE);
+template<typename T>
+Kernel BSContext::buildKernel() {
+    auto src = std::string(getKernelExtensionStr<T>()) + getKernelSourceStr();;
 
-        size_t i = get_local_id(0);
-        mask = ((2 * j)) | (~(po2cnt - 1));
-        bool b_ascending = !(popcount(mask) & 1);
-        for (uint seq_cnt = 1; seq_cnt <= local_size_x; seq_cnt *= 2) {
-            bool b_bit_already_set = mask & seq_cnt;
-            b_ascending = b_ascending == b_bit_already_set;
-            for (uint subseq_cnt = seq_cnt; subseq_cnt; subseq_cnt /= 2) {
-                size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
-                size_t block_offt = i & (subseq_cnt - 1);
-                size_t sml_idx = block_base | block_offt;
-                size_t big_idx = sml_idx + subseq_cnt;
-                if (b_ascending == (cache[big_idx] < cache[sml_idx])) {
-                    KERNEL_TYPE temp = cache[sml_idx];
-                    cache[sml_idx] = cache[big_idx];
-                    cache[big_idx] = temp;
-                }
-                barrier(CLK_LOCAL_MEM_FENCE);
-            }
-        }
+    size_t max_local_size;
+    cl_ulong max_slm_size_bytes;
+    clGetDeviceInfo(m_dev, CL_DEVICE_MAX_WORK_GROUP_SIZE, sizeof(max_local_size), &max_local_size, nullptr);
+    clGetDeviceInfo(m_dev, CL_DEVICE_LOCAL_MEM_SIZE, sizeof(max_slm_size_bytes), &max_slm_size_bytes, nullptr);
+    auto slm_size_bytes = max_slm_size_bytes / 8;
+    auto slm_size = slm_size_bytes / sizeof(T);
+    auto local_size = std::min(slm_size / 2, max_local_size);
+    auto max_subseq_cnt = slm_size / 2;
+    auto num_thread_elems = max_subseq_cnt / local_size;
 
-        storeCache(data, cnt, cache);
-    };
+    auto build_options = std::string(" -DKERNEL_TYPE=")         + getKernelTypeStr<T>() +
+                                     " -DLOCAL_SIZE="           + std::to_string(local_size) +
+                                     " -DLOCAL_MEM_SIZE_BYTES=" + std::to_string(slm_size_bytes) +
+                                     " -DMIN_VALUE="            + minVStr<T>() +
+                                     " -DMAX_VALUE="            + maxVStr<T>();
 
-    __attribute__((reqd_work_group_size(local_size_x, 1, 1)))
-    __kernel void bitonicSort(
-       __global KERNEL_TYPE* data, uint cnt,
-       uint seq_cnt, uint subseq_cnt
-    ) {
-        size_t i = get_global_id(0);
-        uint po2cnt = 1 << (32 - clz(cnt - 1));
-        uint mask = ((2 * i)) | (2 * seq_cnt - 1) | (~(po2cnt - 1));
-        bool b_ascending = !(popcount(mask) & 1);
-        size_t block_base = (i & ~(subseq_cnt - 1)) * 2;
-        size_t block_offt = i & (subseq_cnt - 1);
-        size_t sml_idx = block_base | block_offt;
-        size_t big_idx = sml_idx + subseq_cnt;
-        bool b_sort = sml_idx < cnt && big_idx < cnt;
-        if (b_sort) {
-            if (b_ascending == (data[big_idx] < data[sml_idx])) {
-                KERNEL_TYPE temp = data[sml_idx];
-                data[sml_idx] = data[big_idx];
-                data[big_idx] = temp;
-            }
-        }
-    })";
     auto src_c_str = src.c_str();
-
-    auto local_sz = 16u;
-    auto build_options = std::string(" -DKERNEL_TYPE=") + getKernelTypeStr<T>() +
-                                     " -DLOCAL_SIZE_X=" + std::to_string(local_sz) +
-                                     " -DMIN_VALUE="    + minVStr<T>() +
-                                     " -DMAX_VALUE="    + maxVStr<T>();
-
     auto prog = clCreateProgramWithSource(m_ctx, 1, &src_c_str, nullptr, nullptr);
     auto prog_err = clBuildProgram(prog, 1, &m_dev, build_options.c_str(), nullptr, nullptr);
     if (prog_err == CL_BUILD_PROGRAM_FAILURE) {
@@ -371,8 +404,8 @@ Kernel BSContext::buildKernel() {
         throw std::runtime_error{std::string("Failed to build program:\n") + log.data()};
     }
     auto slow_ker = clCreateKernel(prog, "bitonicSort", nullptr);
-    auto fast_ker = clCreateKernel(prog, "bitonicSortLocal", nullptr);
-    auto start_ker = clCreateKernel(prog, "bitonicSortFastStart", nullptr);
+    auto fast_ker = clCreateKernel(prog, "bitonicSortFast", nullptr);
+    auto start_ker = clCreateKernel(prog, "bitonicSortStart", nullptr);
 
     clReleaseProgram(prog);
 
@@ -380,8 +413,20 @@ Kernel BSContext::buildKernel() {
         .slow = slow_ker,
         .fast = fast_ker,
         .start = start_ker,
-        .local_sz = local_sz,
+        .local_size = local_size,
+        .num_thread_elems = num_thread_elems,
+        .max_subseq_cnt = max_subseq_cnt,
     };
+}
+
+template<typename T>
+T ceilDiv(T top, T bot) {
+    return top / bot + (top % bot != 0);
+}
+
+template<typename T>
+T pad(T x, T m) {
+    return ceilDiv(x, m) * m;
 }
 
 template<typename T>
@@ -399,23 +444,22 @@ void BSRunKernel(BSContext& ctx, cl_mem buf, size_t cnt) {
     clSetKernelArg(ker.fast, 1, sizeof(clcnt), &clcnt);
     clSetKernelArg(ker.start, 1, sizeof(clcnt), &clcnt);
     {
-        size_t global_sz = (cnt / 2 / ker.local_sz + (cnt / 2 % ker.local_sz != 0)) * ker.local_sz;
+        size_t global_sz = pad(ceilDiv(cnt / 2, ker.num_thread_elems), ker.local_size);
         clEnqueueNDRangeKernel(q, ker.start, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
     }
-    for (cl_uint seq_cnt = 2 * ker.local_sz; seq_cnt < cnt; seq_cnt *= 2) {
+    for (cl_uint seq_cnt = 2 * ker.max_subseq_cnt; seq_cnt < cnt; seq_cnt *= 2) {
         cl_uint subseq_cnt = seq_cnt;
-        for (; subseq_cnt > ker.local_sz; subseq_cnt /= 2) {
+        for (; subseq_cnt > ker.max_subseq_cnt; subseq_cnt /= 2) {
             clSetKernelArg(ker.slow, 2, sizeof(seq_cnt), &seq_cnt);
             clSetKernelArg(ker.slow, 3, sizeof(subseq_cnt), &subseq_cnt);
             auto rem = pad_cnt & (2 * subseq_cnt - 1);
             auto disable_cnt = std::min<size_t>(rem, subseq_cnt) + (pad_cnt - rem) / 2;
             size_t global_sz = po2cnt / 2 - disable_cnt;
-            global_sz = (global_sz / ker.local_sz + (global_sz % ker.local_sz != 0)) * ker.local_sz;
             clEnqueueNDRangeKernel(q, ker.slow, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
         }
         clSetKernelArg(ker.fast, 2, sizeof(seq_cnt), &seq_cnt);
         clSetKernelArg(ker.fast, 3, sizeof(subseq_cnt), &subseq_cnt);
-        size_t global_sz = (cnt / 2 / ker.local_sz + (cnt / 2 % ker.local_sz != 0)) * ker.local_sz;
+        size_t global_sz = pad(ceilDiv(cnt / 2, ker.num_thread_elems), ker.local_size);
         clEnqueueNDRangeKernel(q, ker.fast, 1, nullptr, &global_sz, nullptr, 0, nullptr, nullptr);
     }
 }
