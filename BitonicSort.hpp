@@ -223,7 +223,12 @@ const Kernel& BSContext::kernel() {
 template<typename T>
 auto minVStr() {
     if constexpr (std::is_floating_point_v<T>) {
-        return "\"(-1.0 / 0.0)\"";
+        if constexpr (std::is_same_v<T, float>) {
+            return "(-HUGE_VALF)";
+        }
+        else {
+            return "(-HUGE_VAL)";
+        }
     }
     else {
         return std::to_string(std::numeric_limits<T>::min());
@@ -233,7 +238,12 @@ auto minVStr() {
 template<typename T>
 auto maxVStr() {
     if constexpr (std::is_floating_point_v<T>) {
-        return "\"(1.0 / 0.0)\"";
+        if constexpr (std::is_same_v<T, float>) {
+            return "(HUGE_VALF)";
+        }
+        else {
+            return "(HUGE_VAL)";
+        }
     }
     else {
         return std::to_string(std::numeric_limits<T>::max());
